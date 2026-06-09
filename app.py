@@ -114,34 +114,75 @@ def fetch_corp_codes(key: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
-def fetch_recent_filer_codes(key: str) -> set:
+def fetch_recent_filer_codes(key: str, debug_container=None) -> set:
     """
     최근 2년 사업보고서 제출 기업 corp_code 집합.
-    corp_cls 없이 전체 조회 → corpCode.xml 비상장 목록과 교차 필터는 호출부에서.
-    최대 10페이지(1,000개) 수집.
+    pblntf_detail_ty 없이 pblntf_ty=A(정기공시)로 조회해서 더 넓게 잡음.
+    최대 20페이지(2,000개) 수집.
     """
     end_date   = datetime.today().strftime("%Y%m%d")
     start_date = (datetime.today() - timedelta(days=730)).strftime("%Y%m%d")
     codes = set()
-    for page in range(1, 11):
+    debug_lines = []
+
+    # 시도 1: pblntf_detail_ty=A001 (사업보고서)
+    for page in range(1, 21):
         try:
             r = requests.get(
                 "https://opendart.fss.or.kr/api/list.json",
                 params={"crtfc_key": key,
                         "bgn_de": start_date, "end_de": end_date,
-                        "pblntf_detail_ty": "A001",   # 사업보고서
+                        "pblntf_detail_ty": "A001",
                         "page_no": str(page), "page_count": "100"},
                 timeout=12,
             )
             d = r.json()
-            if d.get("status") != "000": break
+            status = d.get("status")
+            msg    = d.get("message","")
+            cnt    = len(d.get("list",[]))
+            total_p= d.get("total_page", 1)
+            debug_lines.append(f"[A001 p{page}] status={status} msg={msg} list={cnt}건 total_page={total_p}")
+            if status != "000": break
             for item in d.get("list", []):
-                cc = item.get("corp_code", "")
+                cc = item.get("corp_code","")
                 if cc: codes.add(cc)
-            if page >= int(d.get("total_page", 1)): break
-        except Exception:
+            if page >= int(total_p): break
+        except Exception as e:
+            debug_lines.append(f"[A001 p{page}] 예외: {e}")
             break
+
+    debug_lines.append(f"→ A001 수집 합계: {len(codes)}개")
+
+    # 시도 2: 코드가 없으면 pblntf_ty=A (정기공시 전체)로 재시도
+    if len(codes) == 0:
+        for page in range(1, 11):
+            try:
+                r = requests.get(
+                    "https://opendart.fss.or.kr/api/list.json",
+                    params={"crtfc_key": key,
+                            "bgn_de": start_date, "end_de": end_date,
+                            "pblntf_ty": "A",
+                            "page_no": str(page), "page_count": "100"},
+                    timeout=12,
+                )
+                d = r.json()
+                status = d.get("status")
+                cnt    = len(d.get("list",[]))
+                total_p= d.get("total_page", 1)
+                debug_lines.append(f"[pblntf_ty=A p{page}] status={status} list={cnt}건 total_page={total_p}")
+                if status != "000": break
+                for item in d.get("list", []):
+                    cc = item.get("corp_code","")
+                    if cc: codes.add(cc)
+                if page >= int(total_p): break
+            except Exception as e:
+                debug_lines.append(f"[pblntf_ty=A p{page}] 예외: {e}")
+                break
+        debug_lines.append(f"→ pblntf_ty=A 수집 합계: {len(codes)}개")
+
+    if debug_container:
+        debug_container.code("\n".join(debug_lines))
+
     return codes
 
 
@@ -199,13 +240,14 @@ def run_screening(key: str, df_unlisted: pd.DataFrame,
     각 기업당: company.json(업종·대표자) + 재무 병렬 조회.
     """
     # 최근 사업보고서 제출 corp_code와 교집합
+    debug_box = st.expander("🐛 DART list.json 응답 로그", expanded=True)
     with st.spinner("📡 DART 최근 사업보고서 제출 목록 수집 중..."):
-        filer_codes = fetch_recent_filer_codes(key)
+        filer_codes = fetch_recent_filer_codes(key, debug_container=debug_box)
 
     unlisted_set = set(df_unlisted["corp_code"].tolist())
-    candidates   = list(unlisted_set & filer_codes)   # 비상장 + 사보 제출
+    candidates   = list(unlisted_set & filer_codes)
 
-    st.info(f"비상장 외감 후보 {len(candidates):,}개 — 업종·재무 병렬 조회 시작")
+    st.info(f"📊 list.json: {len(filer_codes):,}개 | 비상장DB: {len(unlisted_set):,}개 | 교집합: {len(candidates):,}개")
 
     results = []
     total   = len(candidates)

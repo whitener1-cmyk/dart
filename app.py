@@ -9,12 +9,12 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="KCA M&A 스크리너", layout="wide")
 
-if "selected_corps"   not in st.session_state: st.session_state.selected_corps   = {}
-if "industry_cache"   not in st.session_state: st.session_state.industry_cache   = {}
-# industry_cache: {업종코드prefix: [{"corp_code","corp_name","업종명","대표자","설립일","주소"}, ...]}
+if "selected_corps" not in st.session_state: st.session_state.selected_corps = {}
+if "screened_df"    not in st.session_state: st.session_state.screened_df    = None
+if "screen_done"    not in st.session_state: st.session_state.screen_done    = False
 
 # ══════════════════════════════════════════
-# 업종 전체 목록 (한국표준산업분류 앞 2자리)
+# 업종 전체 목록
 # ══════════════════════════════════════════
 INDUSTRY_MAP = {
     "01":"농업", "02":"임업", "03":"어업",
@@ -40,8 +40,7 @@ INDUSTRY_MAP = {
     "55":"숙박업", "56":"음식점 및 주점업",
     "58":"출판업 (게임/서적/잡지 등)",
     "59":"영상/방송/음악 제작 및 배급업",
-    "60":"방송업",
-    "61":"통신업",
+    "60":"방송업", "61":"통신업",
     "62":"소프트웨어 개발 및 공급업",
     "63":"정보서비스업 (포털/데이터 등)",
     "64":"금융업", "65":"보험 및 연금업", "66":"금융 및 보험관련 서비스업",
@@ -61,16 +60,14 @@ INDUSTRY_MAP = {
     "92":"도박/복권업", "93":"스포츠/오락/레저 서비스업",
     "94":"협회 및 단체", "95":"수리업", "96":"기타 개인 서비스업",
 }
-INDUSTRY_OPTIONS = [f"{v}  [{k}]" for k, v in sorted(INDUSTRY_MAP.items(), key=lambda x: x[0])]
-def parse_prefix(option: str) -> str:
-    return option.split("[")[-1].rstrip("]").strip()
+
 def get_industry_label(code: str) -> str:
     if not code: return "업종 미분류"
     p = str(code).strip().zfill(5)[:2]
     return INDUSTRY_MAP.get(p, f"기타 ({code})")
 
 # ══════════════════════════════════════════
-# 계정명 분류 (IFRS 변형 전부 커버)
+# 계정명 분류
 # ══════════════════════════════════════════
 REVENUE_NAMES = {
     "매출액","매출","수익","수익(매출액)","매출액(수익)","매출액 등",
@@ -87,6 +84,7 @@ NET_INCOME_NAMES = {
     "반기순이익(손실)","분기순이익(손실)",
     "지배기업 소유주 귀속 당기순이익","지배주주지분 순이익",
 }
+
 def classify_account(nm: str):
     nm = nm.strip()
     if nm in REVENUE_NAMES:    return "매출액"
@@ -99,7 +97,8 @@ def classify_account(nm: str):
 # ══════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def fetch_corp_codes(key):
+def fetch_corp_codes(key: str) -> pd.DataFrame:
+    """비상장사만 (stock_code 없는 것)"""
     url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={key}"
     res = requests.get(url, timeout=15)
     res.raise_for_status()
@@ -109,183 +108,155 @@ def fetch_corp_codes(key):
     rows = []
     for c in root.findall("list"):
         sc = (c.findtext("stock_code") or "").strip()
-        if sc: continue   # 상장사 제외
+        if sc: continue
         rows.append({"corp_code": c.findtext("corp_code"),
                      "corp_name": c.findtext("corp_name")})
     return pd.DataFrame(rows)
 
 
-def _fetch_fin_single(key, corp_code, year):
-    """단일 기업·단일 연도 재무 조회 (병렬 처리용 헬퍼)"""
-    base = {"crtfc_key": key, "corp_code": corp_code,
-            "bsns_year": year, "reprt_code": "11011"}
-    for endpoint, fs_div in [("fnlttSinglAcnt", None),
-                              ("fnlttSinglAcntAll", "OFS"),
-                              ("fnlttSinglAcntAll", "CFS")]:
-        params = dict(base)
-        if fs_div: params["fs_div"] = fs_div
-        try:
-            r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}.json",
-                             params=params, timeout=8)
-            d = r.json()
-            if d.get("status") == "000" and d.get("list"):
-                return d
-        except Exception:
-            pass
-    return {}
-
-
-def _extract_figures_raw(fin_data):
-    """재무 데이터 → {매출액, 영업이익, 당기순이익} (억원 float)"""
-    result = {"매출액": None, "영업이익": None, "당기순이익": None}
-    for item in fin_data.get("list", []):
-        key = classify_account(item.get("account_nm", ""))
-        if key and result[key] is None:
-            raw = item.get("thstrm_amount", "").replace(",", "").strip()
-            try:
-                result[key] = round(int(raw) / 1e8, 1)
-            except ValueError:
-                pass
-    return result
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_recent_filers(key, industry_prefix: str,
-                        min_revenue: float = 30.0,
-                        min_operating: float = 3.0) -> list:
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_recent_filer_codes(key: str) -> set:
     """
-    최근 2년 사업보고서 제출 비상장 외감 기업 목록 조회 (최대 500개).
-    ① company.json 병렬 조회 → 업종코드 필터
-    ② 최신연도 재무 병렬 조회 → 매출·영업이익 기준 필터
-    반환: [{"corp_code","corp_name","업종명","대표자","설립일","주소",
-            "매출액","영업이익","EBITDA","당기순이익"}, ...]
+    최근 2년 사업보고서 제출 기업 corp_code 집합.
+    corp_cls 없이 전체 조회 → corpCode.xml 비상장 목록과 교차 필터는 호출부에서.
+    최대 10페이지(1,000개) 수집.
     """
     end_date   = datetime.today().strftime("%Y%m%d")
     start_date = (datetime.today() - timedelta(days=730)).strftime("%Y%m%d")
-
-    # ── 1) 최근 사업보고서 제출 법인 목록 ──
-    corp_codes = set()
-    corp_names = {}
-    for page in range(1, 6):
+    codes = set()
+    for page in range(1, 11):
         try:
             r = requests.get(
                 "https://opendart.fss.or.kr/api/list.json",
-                params={"crtfc_key": key, "bgn_de": start_date, "end_de": end_date,
-                        "pblntf_detail_ty": "A001", "corp_cls": "E",
+                params={"crtfc_key": key,
+                        "bgn_de": start_date, "end_de": end_date,
+                        "pblntf_detail_ty": "A001",   # 사업보고서
                         "page_no": str(page), "page_count": "100"},
-                timeout=10,
+                timeout=12,
             )
             d = r.json()
             if d.get("status") != "000": break
             for item in d.get("list", []):
                 cc = item.get("corp_code", "")
-                if cc:
-                    corp_codes.add(cc)
-                    corp_names[cc] = item.get("corp_name", "")
-            if page >= d.get("total_page", 1): break
+                if cc: codes.add(cc)
+            if page >= int(d.get("total_page", 1)): break
         except Exception:
             break
+    return codes
 
-    if not corp_codes:
-        return []
 
-    # ── 2) 병렬 company.json → 업종 필터 ──
-    industry_matched = []
+def fetch_company_info_single(key: str, corp_code: str) -> dict:
+    try:
+        r = requests.get("https://opendart.fss.or.kr/api/company.json",
+                         params={"crtfc_key": key, "corp_code": corp_code},
+                         timeout=7)
+        d = r.json()
+        return d if d.get("status") == "000" else {}
+    except Exception:
+        return {}
 
-    def _fetch_info(cc):
-        try:
-            r = requests.get("https://opendart.fss.or.kr/api/company.json",
-                             params={"crtfc_key": key, "corp_code": cc}, timeout=6)
-            d = r.json()
-            if d.get("status") == "000":
-                code = str(d.get("induty_code", "")).strip().zfill(5)
-                if code[:2] == industry_prefix:
-                    return {
-                        "corp_code": cc,
-                        "corp_name": d.get("corp_name", corp_names.get(cc, "")),
-                        "업종명":    get_industry_label(code),
-                        "업종코드":  code,
-                        "대표자":    d.get("ceo_nm", "-"),
-                        "설립일":    d.get("est_dt", "-"),
-                        "주소":      d.get("adres", "-"),
-                    }
-        except Exception:
-            pass
-        return None
+
+def fetch_fin_single(key: str, corp_code: str) -> dict:
+    """최신 연도(2024→2023→2022) 재무. 성공하면 figures + 연도 반환."""
+    base = {"crtfc_key": key, "corp_code": corp_code, "reprt_code": "11011"}
+    for yr in ["2024", "2023", "2022"]:
+        for endpoint, fs_div in [("fnlttSinglAcnt", None),
+                                  ("fnlttSinglAcntAll", "OFS"),
+                                  ("fnlttSinglAcntAll", "CFS")]:
+            params = {**base, "bsns_year": yr}
+            if fs_div: params["fs_div"] = fs_div
+            try:
+                r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}.json",
+                                  params=params, timeout=8)
+                d = r.json()
+                if d.get("status") == "000" and d.get("list"):
+                    figs = _extract_figures(d)
+                    if any(v is not None for v in figs.values()):
+                        return {"연도": yr, **figs}
+            except Exception:
+                pass
+    return {}
+
+
+def _extract_figures(fin_data: dict) -> dict:
+    result = {"매출액": None, "영업이익": None, "당기순이익": None}
+    for item in fin_data.get("list", []):
+        k = classify_account(item.get("account_nm", ""))
+        if k and result[k] is None:
+            raw = item.get("thstrm_amount", "").replace(",", "").strip()
+            try: result[k] = round(int(raw) / 1e8, 1)
+            except ValueError: pass
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# 전체 스크리닝 실행 (세션에 캐시)
+# ══════════════════════════════════════════════════════════════
+def run_screening(key: str, df_unlisted: pd.DataFrame,
+                  min_rev: float, min_op: float) -> pd.DataFrame:
+    """
+    비상장 외감사 기업 중 매출·영업이익 기준 이상인 기업만 반환.
+    각 기업당: company.json(업종·대표자) + 재무 병렬 조회.
+    """
+    # 최근 사업보고서 제출 corp_code와 교집합
+    with st.spinner("📡 DART 최근 사업보고서 제출 목록 수집 중..."):
+        filer_codes = fetch_recent_filer_codes(key)
+
+    unlisted_set = set(df_unlisted["corp_code"].tolist())
+    candidates   = list(unlisted_set & filer_codes)   # 비상장 + 사보 제출
+
+    st.info(f"비상장 외감 후보 {len(candidates):,}개 — 업종·재무 병렬 조회 시작")
+
+    results = []
+    total   = len(candidates)
+    progress = st.progress(0, text="조회 중...")
+    done_count = [0]
+
+    def _process(cc):
+        # ① company.json
+        info = fetch_company_info_single(key, cc)
+        if not info: return None
+        # ② 재무
+        fin = fetch_fin_single(key, cc)
+        if not fin: return None
+        rev  = fin.get("매출액")
+        ebit = fin.get("영업이익")
+        if rev is None or ebit is None: return None
+        if rev < min_rev or ebit < min_op: return None
+        net    = fin.get("당기순이익")
+        ebitda = round(ebit * 1.15, 1) if ebit is not None else None
+        ind_code = str(info.get("induty_code","")).strip().zfill(5)
+        return {
+            "corp_code":   cc,
+            "기업명":      info.get("corp_name", ""),
+            "업종코드앞2": ind_code[:2],
+            "업종명":      get_industry_label(ind_code),
+            "대표자":      info.get("ceo_nm", "-"),
+            "설립일":      info.get("est_dt", "-"),
+            "기준연도":    fin.get("연도",""),
+            "매출액(억)":  rev,
+            "영업이익(억)":ebit,
+            "EBITDA(억)":  ebitda,
+            "당기순이익(억)": net,
+        }
 
     with ThreadPoolExecutor(max_workers=12) as ex:
-        for res in as_completed([ex.submit(_fetch_info, cc) for cc in corp_codes]):
-            r = res.result()
-            if r: industry_matched.append(r)
+        futures = {ex.submit(_process, cc): cc for cc in candidates}
+        for fut in as_completed(futures):
+            done_count[0] += 1
+            progress.progress(min(done_count[0] / max(total,1), 1.0),
+                              text=f"{done_count[0]:,}/{total:,} 조회 중...")
+            res = fut.result()
+            if res: results.append(res)
 
-    if not industry_matched:
-        return []
+    progress.empty()
 
-    # ── 3) 병렬 재무 조회 → 매출·영업이익 필터 ──
-    # 최신 연도(2024) 우선, 없으면 2023
-    LATEST_YEARS = ["2024", "2023"]
+    if not results:
+        return pd.DataFrame()
 
-    def _fetch_fin(corp):
-        cc = corp["corp_code"]
-        for yr in LATEST_YEARS:
-            fd = _fetch_fin_single(key, cc, yr)
-            if fd.get("list"):
-                figs = _extract_figures_raw(fd)
-                rev  = figs.get("매출액")
-                ebit = figs.get("영업이익")
-                net  = figs.get("당기순이익")
-                # 매출 30억 이상, 영업이익 3억 이상 필터
-                if (rev  is not None and rev  >= min_revenue and
-                    ebit is not None and ebit >= min_operating):
-                    ebitda = round(ebit * 1.15, 1) if ebit is not None else None
-                    return {**corp,
-                            "기준연도":   yr,
-                            "매출액":     rev,
-                            "영업이익":   ebit,
-                            "EBITDA":     ebitda,
-                            "당기순이익": net}
-        return None   # 필터 미통과
-
-    final = []
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        for res in as_completed([ex.submit(_fetch_fin, c) for c in industry_matched]):
-            r = res.result()
-            if r: final.append(r)
-
-    # 매출액 오름차순 정렬
-    return sorted(final, key=lambda x: (x.get("매출액") or 0))
-
-
-def fetch_financial_robust(key, corp_code, year):
-    base = {"crtfc_key": key, "corp_code": corp_code,
-            "bsns_year": year, "reprt_code": "11011"}
-    attempts = [
-        ("fnlttSinglAcnt",    None),
-        ("fnlttSinglAcntAll", "OFS"),
-        ("fnlttSinglAcntAll", "CFS"),
-    ]
-    logs = []
-    for endpoint, fs_div in attempts:
-        params = dict(base)
-        if fs_div: params["fs_div"] = fs_div
-        label = f"{endpoint}/{fs_div or 'auto'}"
-        try:
-            r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}.json",
-                             params=params, timeout=10)
-            d = r.json()
-            cnt = len(d.get("list", []))
-            logs.append(f"  {label}: status={d.get('status')}, {cnt}건")
-            if d.get("status") == "000" and cnt > 0:
-                d["_fs_div"] = fs_div or "auto"
-                d["_logs"]   = logs
-                return d
-        except Exception as e:
-            logs.append(f"  {label}: 예외 {e}")
-    return {"_logs": logs}
-
-
-def extract_figures(fin_data):
-    return _extract_figures_raw(fin_data)
+    df = pd.DataFrame(results)
+    df = df.sort_values("매출액(억)", ascending=True).reset_index(drop=True)
+    return df
 
 
 # ══════════════════════════════════════════
@@ -312,99 +283,136 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
         st.info("왼쪽 사이드바에 DART API 인증키를 입력하면 활성화됩니다.")
         st.stop()
 
-    # ── STEP 1: 업종 선택 ──
-    st.subheader("① 업종 선택")
-    selected_option = st.selectbox(
-        "분석할 업종을 선택하세요",
-        options=["— 업종을 선택하세요 —"] + INDUSTRY_OPTIONS,
-    )
+    # 비상장 법인 DB 로드
+    with st.spinner("DART 비상장 법인 DB 로드 중..."):
+        try:
+            df_all = fetch_corp_codes(api_key)
+        except Exception as e:
+            st.error(f"DART 인증 실패: {e}")
+            st.stop()
 
-    if selected_option == "— 업종을 선택하세요 —":
-        st.info("업종을 선택하면 해당 업종의 비상장 외감 법인 목록이 나타납니다.")
-        st.stop()
+    # ── 스크리닝 실행 버튼 ──
+    col_btn, col_info = st.columns([2, 5])
+    with col_btn:
+        run_btn = st.button("🚀 전체 스크리닝 실행",
+                            help="매출 30억↑ · 영업이익 3억↑ 비상장 기업 전체 조회 (수 분 소요)",
+                            type="primary")
+    with col_info:
+        st.caption("최초 1회 실행 후 결과가 세션에 저장됩니다. 필터는 아래에서 실시간으로 조정하세요.")
 
-    industry_prefix = parse_prefix(selected_option)
-    industry_name   = INDUSTRY_MAP.get(industry_prefix, selected_option)
+    if run_btn:
+        st.session_state.screen_done = False
+        st.session_state.screened_df = None
 
-    # ── STEP 2: 해당 업종 기업 목록 조회 ──
-    cache_key = industry_prefix
-    if cache_key not in st.session_state.industry_cache:
-        with st.spinner(f"'{industry_name}' 업종 비상장 기업 조회 + 재무 필터링 중... (최초 1회, 약 30~60초 소요)"):
-            corps = fetch_recent_filers(api_key, industry_prefix, min_revenue=30.0, min_operating=3.0)
-        st.session_state.industry_cache[cache_key] = corps
-    else:
-        corps = st.session_state.industry_cache[cache_key]
+    if run_btn or not st.session_state.screen_done:
+        if run_btn:
+            df_screened = run_screening(api_key, df_all, min_rev=30.0, min_op=3.0)
+            st.session_state.screened_df  = df_screened
+            st.session_state.screen_done  = True
+        elif not st.session_state.screen_done:
+            st.info("위 '🚀 전체 스크리닝 실행' 버튼을 눌러 시작하세요.")
+            st.stop()
 
-    if not corps:
-        st.warning(
-            f"'{industry_name}' 업종에서 매출 30억·영업이익 3억 이상 비상장 외감 법인을 찾지 못했습니다.\n\n"
-            "다른 업종을 선택하거나, 기업명 직접 검색을 이용해주세요."
-        )
-    else:
-        st.success(f"✅ '{industry_name}' 업종 · 매출 30억↑ · 영업이익 3억↑ 기업 **{len(corps)}개** 조회 완료")
+    if st.session_state.screen_done and st.session_state.screened_df is not None:
+        df_base = st.session_state.screened_df.copy()
 
-        # 기업 목록 표 — 재무 컬럼 포함
-        df_corps = pd.DataFrame(corps)[[
-            "corp_name","업종명","기준연도","매출액","영업이익","EBITDA","당기순이익","대표자","설립일"
-        ]].copy()
-        df_corps.columns = ["기업명","업종","기준연도","매출액(억)","영업이익(억)","EBITDA(억)","당기순이익(억)","대표자","설립일"]
-        # 매출액 오름차순 (이미 정렬됐지만 표에서도 명시)
-        df_corps = df_corps.sort_values("매출액(억)", ascending=True).reset_index(drop=True)
+        if df_base.empty:
+            st.warning("조건에 맞는 기업을 찾지 못했습니다.")
+            st.stop()
 
-        # 기업명 키워드 추가 필터 (선택)
-        kw = st.text_input("🔎 목록 내 기업명 필터 (선택사항)", placeholder="예: 스튜디오, 엔터")
+        st.success(f"✅ 매출 30억↑ · 영업이익 3억↑ 비상장 기업 총 **{len(df_base)}개** 조회 완료")
+
+        # ── 필터 영역 ──
+        st.subheader("🔽 필터 & 검색")
+        f1, f2 = st.columns([3, 2])
+
+        with f1:
+            # 업종 멀티셀렉트 (실제 조회된 업종만 표시)
+            available_industries = sorted(df_base["업종명"].dropna().unique().tolist())
+            sel_industries = st.multiselect(
+                "업종 필터 (미선택 = 전체)",
+                options=available_industries,
+                default=[],
+                placeholder="업종을 선택하세요 (복수 선택 가능)",
+            )
+
+        with f2:
+            # 기업명 검색
+            kw = st.text_input("🔎 기업명 검색", placeholder="예: 스튜디오, 엔터, 게임")
+
+        # 필터 적용
+        df_view = df_base.copy()
+        if sel_industries:
+            df_view = df_view[df_view["업종명"].isin(sel_industries)]
         if kw:
-            df_corps = df_corps[df_corps["기업명"].str.contains(kw, na=False)]
+            df_view = df_view[df_view["기업명"].str.contains(kw, na=False)]
 
-        st.subheader(f"② 기업 목록 ({len(df_corps)}개)  ·  필터: 매출 30억↑ · 영업이익 3억↑ · 매출액 오름차순")
-        st.dataframe(df_corps, use_container_width=True, hide_index=True)
+        # ── 목록 표시 ──
+        st.subheader(f"📋 기업 목록 ({len(df_view)}개) — 매출액 오름차순")
+        display_cols = ["기업명","업종명","기준연도","매출액(억)","영업이익(억)","EBITDA(억)","당기순이익(억)","대표자","설립일"]
+        st.dataframe(
+            df_view[display_cols].reset_index(drop=True),
+            use_container_width=True, hide_index=True,
+        )
 
-        if df_corps.empty:
+        if df_view.empty:
             st.warning("필터 조건에 맞는 기업이 없습니다.")
             st.stop()
 
-        # ── STEP 3: 기업 선택 → 상세 분석 ──
-        st.subheader("③ 기업 선택 후 정밀 분석")
-        selected_name = st.selectbox("분석할 기업 선택", df_corps["기업명"].tolist())
+        # ── 기업 선택 → 정밀 분석 ──
+        st.divider()
+        st.subheader("🔍 정밀 분석")
+        selected_name = st.selectbox("분석할 기업 선택", df_view["기업명"].tolist())
 
-        corp_data = next((c for c in corps if c["corp_name"] == selected_name), None)
-        if not corp_data:
-            st.stop()
+        row_s = df_view[df_view["기업명"] == selected_name].iloc[0]
+        corp_code = row_s["corp_code"]
 
-        corp_code = corp_data["corp_code"]
-
-        # 기업 기본 정보
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("대표자",   corp_data.get("대표자","-"))
-        c2.metric("업종",     corp_data.get("업종명","-"))
-        c3.metric("설립일",   corp_data.get("설립일","-"))
+        c1.metric("대표자",   row_s.get("대표자", "-"))
+        c2.metric("업종",     row_s.get("업종명", "-"))
+        c3.metric("설립일",   row_s.get("설립일", "-"))
         c4.metric("법인구분", "비상장 외감")
-        st.caption(f"주소: {corp_data.get('주소','-')}")
 
-        # 재무 3개년
+        # 3개년 재무
         st.subheader(f"📈 {selected_name} — 3개년 재무 추이")
-
-        years    = ["2024","2023","2022"]
+        years    = ["2024", "2023", "2022"]
         fin_rows = []
+        all_logs = []
         fs_div_used = None
-        all_logs    = []
 
-        progress = st.progress(0, text="재무 데이터 조회 중...")
+        prog = st.progress(0, text="재무 데이터 조회 중...")
         for i, yr in enumerate(years):
-            progress.progress((i+1)/len(years), text=f"{yr}년 조회 중...")
-            fin_data = fetch_financial_robust(api_key, corp_code, yr)
-            all_logs.extend([f"\n[{yr}년]"] + fin_data.get("_logs",[]))
-            if not fin_data.get("list"): continue
-            if fs_div_used is None:
-                fs_div_used = fin_data.get("_fs_div","?")
-            figures = extract_figures(fin_data)
-            if any(v is not None for v in figures.values()):
-                r = {"연도": yr}
-                r.update(figures)
-                if figures["영업이익"] is not None:
-                    r["EBITDA(추정)"] = round(figures["영업이익"]*1.15, 1)
-                fin_rows.append(r)
-        progress.empty()
+            prog.progress((i+1)/len(years), text=f"{yr}년 조회 중...")
+            base_p = {"crtfc_key": api_key, "corp_code": corp_code,
+                      "bsns_year": yr, "reprt_code": "11011"}
+            fin_data = {}
+            for endpoint, fs_div in [("fnlttSinglAcnt", None),
+                                      ("fnlttSinglAcntAll", "OFS"),
+                                      ("fnlttSinglAcntAll", "CFS")]:
+                params = dict(base_p)
+                if fs_div: params["fs_div"] = fs_div
+                label = f"{endpoint}/{fs_div or 'auto'}"
+                try:
+                    r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}.json",
+                                     params=params, timeout=10)
+                    d = r.json()
+                    cnt = len(d.get("list", []))
+                    all_logs.append(f"[{yr}] {label}: status={d.get('status')}, {cnt}건")
+                    if d.get("status") == "000" and cnt > 0:
+                        fin_data = d
+                        if fs_div_used is None:
+                            fs_div_used = fs_div or "auto"
+                        break
+                except Exception as e:
+                    all_logs.append(f"[{yr}] {label}: 예외 {e}")
+            figs = _extract_figures(fin_data)
+            if any(v is not None for v in figs.values()):
+                r_row = {"연도": yr}
+                r_row.update(figs)
+                if figs["영업이익"] is not None:
+                    r_row["EBITDA(추정)"] = round(figs["영업이익"] * 1.15, 1)
+                fin_rows.append(r_row)
+        prog.empty()
 
         if debug_mode:
             with st.expander("🐛 DART API 로그"):
@@ -415,16 +423,14 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
             st.caption(f"📌 재무제표 기준: {fs_label}")
             df_fin = pd.DataFrame(fin_rows).set_index("연도")
             st.table(df_fin)
-            chart_col = st.selectbox("차트 항목", [c for c in df_fin.columns if df_fin[c].notna().any()])
+            chart_col = st.selectbox("차트 항목",
+                [c for c in df_fin.columns if df_fin[c].notna().any()])
             st.bar_chart(df_fin[[chart_col]])
         else:
-            st.warning(
-                f"📭 {selected_name}의 재무 데이터가 DART에 없습니다.\n\n"
-                "외감 대상이어도 제출 지연 또는 면제 기업은 데이터가 없을 수 있습니다."
-            )
+            st.warning("재무 데이터 없음 — 수동 입력을 이용해주세요.")
 
         # 수동 입력
-        with st.expander("✏️ 재무 데이터 수동 입력 (DART 미등록 기업용)", expanded=not fin_rows):
+        with st.expander("✏️ 재무 수동 입력 (DART 미등록 기업용)", expanded=not fin_rows):
             st.caption("단위: 억원")
             mc1, mc2, mc3 = st.columns(3)
             with mc1: m_rev  = st.number_input("매출액",    0.0, step=1.0, key="m_rev")
@@ -434,21 +440,18 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
                 fin_rows = [{"연도":"수동입력","매출액": m_rev or None,
                              "영업이익": m_ebit or None, "당기순이익": m_net or None,
                              "EBITDA(추정)": round(m_ebit*1.15,1) if m_ebit else None}]
-                st.success("수동 입력 데이터가 장바구니에 반영됩니다.")
 
         # 장바구니
         st.divider()
         st.subheader("🛒 인수 장바구니")
         in_cart = selected_name in st.session_state.selected_corps
-        toggle  = st.checkbox(
-            f"⭐ {selected_name}을 인수 후보로 장바구니에 담기",
-            value=in_cart, key=f"cart_{corp_code}",
-        )
+        toggle  = st.checkbox(f"⭐ {selected_name}을 인수 후보로 장바구니에 담기",
+                              value=in_cart, key=f"cart_{corp_code}")
         latest_fin = fin_rows[0] if fin_rows else {}
         if toggle and not in_cart:
             st.session_state.selected_corps[selected_name] = {
                 "corp_code": corp_code,
-                "업종명": corp_data.get("업종명","-"),
+                "업종명": row_s.get("업종명", "-"),
                 **latest_fin,
             }
             st.toast(f"✅ {selected_name} 추가!")

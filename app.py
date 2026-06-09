@@ -10,17 +10,38 @@ st.set_page_config(page_title="KCA M&A 스크리너", layout="wide")
 if "selected_corps" not in st.session_state:
     st.session_state.selected_corps = {}
 
+# ── 계정명 매핑 (DART IFRS 연결재무제표 계정명 모든 변형) ──
+REVENUE_NAMES = {
+    "매출액", "수익(매출액)", "영업수익", "매출", "수익",
+    "매출액(수익)", "I. 매출액", "매출액 등",
+}
+OPERATING_NAMES = {
+    "영업이익", "영업이익(손실)", "영업손익",
+    "영업이익(영업손실)", "영업이익(손실)합계",
+}
+NET_INCOME_NAMES = {
+    "당기순이익", "당기순이익(손실)", "당기순손익",
+    "연결당기순이익", "당기순이익(당기순손실)",
+    "분기순이익", "반기순이익",
+}
+
+def classify_account(nm):
+    """계정명 → 매출액 / 영업이익 / 당기순이익 / None"""
+    nm = nm.strip()
+    if nm in REVENUE_NAMES:   return "매출액"
+    if nm in OPERATING_NAMES: return "영업이익"
+    if nm in NET_INCOME_NAMES: return "당기순이익"
+    return None
+
 # ── 사이드바 ──
 st.sidebar.title("KCA M&A 스크리너")
-api_key = st.sidebar.text_input("🔑 DART API 인증키", type="password")
-debug_mode = st.sidebar.checkbox("🐛 디버그 모드 (오류 상세 표시)", value=True)
-menu_tab = st.sidebar.radio("페이지 이동", ["1. 타깃 스크리닝 & 정밀분석", "2. 장바구니 통합 Valuation"])
+api_key    = st.sidebar.text_input("🔑 DART API 인증키", type="password")
+debug_mode = st.sidebar.checkbox("🐛 디버그 모드", value=False)
+menu_tab   = st.sidebar.radio("페이지 이동", ["1. 타깃 스크리닝 & 정밀분석", "2. 장바구니 통합 Valuation"])
 st.sidebar.divider()
-cart_count = len(st.session_state.selected_corps)
-st.sidebar.metric("🛒 장바구니", f"{cart_count}개")
+st.sidebar.metric("🛒 장바구니", f"{len(st.session_state.selected_corps)}개")
 for name in st.session_state.selected_corps:
     st.sidebar.write(f"• {name}")
-
 
 # ── DART API 함수 ──
 
@@ -54,71 +75,59 @@ def fetch_company_info(key, corp_code):
     return d if d.get("status") == "000" else {}
 
 
-def fetch_financial_robust(key, corp_code, year, debug=False):
-    """
-    4가지 조합 순서로 시도:
-    1. fnlttSinglAcntAll + CFS (연결)
-    2. fnlttSinglAcntAll + OFS (별도)
-    3. fnlttSinglAcnt (구버전, 연결/별도 자동)
-    4. 반기보고서(11012)로 재시도 → 사업보고서 미제출 기업 대비
-    """
-    debug_logs = []
-
+def fetch_financial_robust(key, corp_code, year):
+    """CFS → OFS → 구버전 순서로 시도. 성공하면 즉시 반환."""
+    base = {"crtfc_key": key, "corp_code": corp_code,
+            "bsns_year": year, "reprt_code": "11011"}
     attempts = [
-        ("fnlttSinglAcntAll", "CFS",  "11011"),
-        ("fnlttSinglAcntAll", "OFS",  "11011"),
-        ("fnlttSinglAcnt",    None,   "11011"),
-        ("fnlttSinglAcnt",    None,   "11012"),  # 반기보고서 fallback
+        ("fnlttSinglAcntAll", "CFS"),
+        ("fnlttSinglAcntAll", "OFS"),
+        ("fnlttSinglAcnt",    None),
     ]
-
-    for endpoint, fs_div, reprt_code in attempts:
-        params = {
-            "crtfc_key":   key,
-            "corp_code":   corp_code,
-            "bsns_year":   year,
-            "reprt_code":  reprt_code,
-        }
+    logs = []
+    for endpoint, fs_div in attempts:
+        params = dict(base)
         if fs_div:
             params["fs_div"] = fs_div
-
-        label = f"{endpoint} / {fs_div or 'auto'} / reprt={reprt_code}"
+        label = f"{endpoint}/{fs_div or 'auto'}"
         try:
-            r = requests.get(
-                f"https://opendart.fss.or.kr/api/{endpoint}.json",
-                params=params, timeout=10,
-            )
+            r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}.json",
+                             params=params, timeout=10)
             d = r.json()
-            status  = d.get("status", "?")
-            message = d.get("message", "")
-            count   = len(d.get("list", []))
-            debug_logs.append(f"  [{label}] status={status}, msg={message}, list={count}건")
-
-            if status == "000" and count > 0:
-                d["_fs_div_used"]  = fs_div or "auto"
-                d["_endpoint"]     = endpoint
-                d["_reprt_code"]   = reprt_code
-                d["_debug_logs"]   = debug_logs
+            cnt = len(d.get("list", []))
+            logs.append(f"  {label}: status={d.get('status')}, list={cnt}건")
+            if d.get("status") == "000" and cnt > 0:
+                d["_fs_div"] = fs_div or "auto"
+                d["_logs"]   = logs
                 return d
         except Exception as e:
-            debug_logs.append(f"  [{label}] 예외: {e}")
-            continue
-
-    return {"_debug_logs": debug_logs}
+            logs.append(f"  {label}: 예외 {e}")
+    return {"_logs": logs}
 
 
-def extract_figures(fin_data):
-    """매출액·영업이익·당기순이익 추출. 없으면 None."""
-    targets = {"매출액": None, "영업이익": None, "당기순이익": None}
+def extract_figures(fin_data, show_debug=False):
+    """
+    핵심 수정: 정확한 계정명 매칭 대신 분류 함수 사용.
+    디버그 모드면 실제 계정명 목록도 반환.
+    """
+    result = {"매출액": None, "영업이익": None, "당기순이익": None}
+    found_names = []   # 디버그용
+
     for item in fin_data.get("list", []):
-        nm  = item.get("account_nm", "")
-        if nm in targets and targets[nm] is None:
-            raw = item.get("thstrm_amount", "").replace(",", "").strip()
-            # 음수 처리: '-' 로 시작하면 음수
+        nm     = item.get("account_nm", "").strip()
+        key    = classify_account(nm)
+        raw    = item.get("thstrm_amount", "").replace(",", "").strip()
+
+        if show_debug and raw:
+            found_names.append(f"{nm} → {key or '무시'} ({raw})")
+
+        if key and result[key] is None and raw:
             try:
-                targets[nm] = round(int(raw) / 1e8, 1)
+                result[key] = round(int(raw) / 1e8, 1)
             except ValueError:
                 pass
-    return targets
+
+    return result, found_names
 
 
 # ════════════════════════════════════════════════════════════════
@@ -128,10 +137,9 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
     st.title("🎯 M&A 타깃 스크리닝 & DART 정밀 분석")
 
     if not api_key:
-        st.info("왼쪽 사이드바에 DART API 인증키를 입력하면 시스템이 활성화됩니다.")
+        st.info("왼쪽 사이드바에 DART API 인증키를 입력하면 활성화됩니다.")
         st.stop()
 
-    # ── 법인 DB 로드 ──
     with st.spinner("DART 법인 DB 동기화 중..."):
         try:
             df_all = fetch_corp_codes(api_key)
@@ -140,7 +148,6 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
             st.stop()
     st.success(f"✅ DART DB 로드 완료 — 총 {len(df_all):,}개 법인")
 
-    # ── 기업 검색 ──
     st.subheader("🔍 기업명 검색")
     col_kw, col_opt = st.columns([3, 1])
     with col_kw:
@@ -174,10 +181,7 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
     corp_code = row["corp_code"]
     is_listed = row["is_listed"]
 
-    if debug_mode:
-        st.info(f"🐛 corp_code: `{corp_code}` | stock_code: `{row['stock_code']}` | is_listed: `{is_listed}`")
-
-    # ── 기업 기본 정보 ──
+    # 기업 기본 정보
     with st.spinner("기업 기본 정보 조회 중..."):
         info = fetch_company_info(api_key, corp_code)
     if info:
@@ -188,32 +192,37 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
         c4.metric("법인구분", info.get("corp_cls",    "-"))
         st.caption(f"주소: {info.get('adres', '-')}")
 
-    # ── 재무 3개년 ──
+    # 재무 3개년
     st.subheader(f"📈 {selected_name} — 3개년 재무 추이")
 
     if not is_listed:
-        st.warning("비상장사는 DART 주요재무 API를 지원하지 않습니다. 감사보고서 PDF를 DART에서 직접 조회하세요.")
+        st.warning("비상장사는 DART 주요재무 API를 지원하지 않습니다.")
         fin_rows = []
     else:
-        # 2024년 포함 (2025년 현재 제출됐을 가능성 높음) + 2023, 2022
-        years    = ["2024", "2023", "2022"]
-        fin_rows = []
+        years       = ["2024", "2023", "2022"]
+        fin_rows    = []
         fs_div_used = None
-        all_debug   = []
+        all_logs    = []
 
         progress = st.progress(0, text="재무 데이터 조회 중...")
         for i, yr in enumerate(years):
             progress.progress((i + 1) / len(years), text=f"{yr}년 조회 중...")
-            fin_data = fetch_financial_robust(api_key, corp_code, yr, debug=debug_mode)
-
-            # 디버그 로그 수집
-            all_debug.extend([f"[{yr}년]"] + fin_data.get("_debug_logs", []))
+            fin_data = fetch_financial_robust(api_key, corp_code, yr)
+            all_logs.extend([f"\n[{yr}년]"] + fin_data.get("_logs", []))
 
             if not fin_data.get("list"):
                 continue
             if fs_div_used is None:
-                fs_div_used = fin_data.get("_fs_div_used", "?")
-            figures = extract_figures(fin_data)
+                fs_div_used = fin_data.get("_fs_div", "?")
+
+            figures, acct_names = extract_figures(fin_data, show_debug=debug_mode)
+
+            if debug_mode:
+                all_logs.append(f"  ▶ 계정명 매칭 결과: {figures}")
+                all_logs.append(f"  ▶ 전체 계정명 샘플 (상위 20개):")
+                for nm in acct_names[:20]:
+                    all_logs.append(f"    {nm}")
+
             if any(v is not None for v in figures.values()):
                 r = {"연도": yr}
                 r.update(figures)
@@ -222,10 +231,9 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
                 fin_rows.append(r)
         progress.empty()
 
-        # 디버그 로그 표시
-        if debug_mode and all_debug:
-            with st.expander("🐛 DART API 응답 로그 (디버그)", expanded=True):
-                st.code("\n".join(all_debug))
+        if debug_mode:
+            with st.expander("🐛 DART API 응답 로그", expanded=True):
+                st.code("\n".join(all_logs))
 
         if fin_rows:
             fs_label = {"CFS": "연결(CFS)", "OFS": "별도(OFS)", "auto": "자동"}.get(fs_div_used, fs_div_used)
@@ -235,16 +243,15 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
             chart_col = st.selectbox("차트 항목", [c for c in df_fin.columns if df_fin[c].notna().any()])
             st.bar_chart(df_fin[[chart_col]])
         else:
-            st.error("재무 데이터를 가져오지 못했습니다. 위 디버그 로그를 확인해주세요.")
+            st.error("재무 데이터를 가져오지 못했습니다. 디버그 모드를 켜고 계정명 로그를 확인해주세요.")
 
-    # ── 장바구니 ──
+    # 장바구니
     st.divider()
     st.subheader("🛒 인수 장바구니")
     in_cart = selected_name in st.session_state.selected_corps
     toggle  = st.checkbox(
         f"⭐ {selected_name}을 인수 후보로 장바구니에 담기",
-        value=in_cart,
-        key=f"cart_{corp_code}",
+        value=in_cart, key=f"cart_{corp_code}",
     )
     latest_fin = fin_rows[0] if fin_rows else {}
     if toggle and not in_cart:
@@ -270,18 +277,16 @@ elif menu_tab == "2. 장바구니 통합 Valuation":
         st.warning("1페이지에서 기업을 장바구니에 담아주세요.")
         st.stop()
     if n < 2:
-        st.info(f"현재 {n}개 선택됨 — 2개 이상이면 비교 분석이 풍부해집니다.")
+        st.info(f"현재 {n}개 — 2개 이상이면 비교 분석이 풍부해집니다.")
 
     st.write(f"**선택 기업 {n}개**: {', '.join(cart.keys())}")
 
-    # ── Valuation 배수 ──
     st.header("1. Valuation 배수 설정")
     c1, c2, c3, c4 = st.columns(4)
     with c1: m_ebit   = st.slider("EV/영업이익", 3.0, 40.0, 10.0, 0.5)
     with c2: m_ebitda = st.slider("EV/EBITDA",   3.0, 40.0,  8.0, 0.5)
     with c3: m_per    = st.slider("PER",          5.0, 50.0, 15.0, 1.0)
     with c4: m_psr    = st.slider("PSR",          0.5, 20.0,  1.5, 0.1)
-
     method = st.radio("메인 Valuation 지표", ["EV/영업이익", "EV/EBITDA", "PER", "PSR"], horizontal=True)
 
     val_rows = []
@@ -298,16 +303,13 @@ elif menu_tab == "2. 장바구니 통합 Valuation":
         else:                                     ev = None
 
         val_rows.append({
-            "기업명":        name,
-            "매출액(억)":    rev,
-            "영업이익(억)":  ebit,
-            "당기순이익(억)": net,
-            "산출 EV(억)":   ev,
+            "기업명": name, "매출액(억)": rev, "영업이익(억)": ebit,
+            "당기순이익(억)": net, "산출 EV(억)": ev,
             "Market Cap(억)": round(ev - 10, 1) if ev else None,
         })
 
-    df_val   = pd.DataFrame(val_rows)
-    no_data  = df_val[df_val["산출 EV(억)"].isna()]["기업명"].tolist()
+    df_val  = pd.DataFrame(val_rows)
+    no_data = df_val[df_val["산출 EV(억)"].isna()]["기업명"].tolist()
     if no_data:
         st.warning(f"⚠️ EV 계산 불가 ({method} 데이터 없음): {', '.join(no_data)}")
 
@@ -316,18 +318,16 @@ elif menu_tab == "2. 장바구니 통합 Valuation":
 
     df_valid = df_val.dropna(subset=["산출 EV(억)"])
     if not df_valid.empty:
-        total_ev  = df_valid["산출 EV(억)"].sum()
-        total_cap = df_valid["Market Cap(억)"].sum()
-        cc1, cc2  = st.columns(2)
-        cc1.metric("총 EV 합계",         f"{total_ev:,.1f} 억원")
-        cc2.metric("총 Market Cap 합계", f"{total_cap:,.1f} 억원")
+        cc1, cc2 = st.columns(2)
+        cc1.metric("총 EV 합계",         f"{df_valid['산출 EV(억)'].sum():,.1f} 억원")
+        cc2.metric("총 Market Cap 합계", f"{df_valid['Market Cap(억)'].sum():,.1f} 억원")
 
         st.divider()
         st.header("3. 인수비용 계산기")
         a1, a2, a3 = st.columns(3)
-        with a1: acq_ratio  = st.number_input("인수 지분 비율 (%)",  51,  100, 100)
-        with a2: cash_ratio = st.number_input("현금 지급 비율 (%)",   0,  100,  10)
-        with a3: discount   = st.number_input("현금 할인율 (%)",       0,   50,   0)
+        with a1: acq_ratio  = st.number_input("인수 지분 비율 (%)", 51, 100, 100)
+        with a2: cash_ratio = st.number_input("현금 지급 비율 (%)",  0, 100,  10)
+        with a3: discount   = st.number_input("현금 할인율 (%)",      0,  50,   0)
         stock_ratio = 100 - cash_ratio
 
         acq_rows = []
@@ -335,16 +335,11 @@ elif menu_tab == "2. 장바구니 통합 Valuation":
             base = round(r["산출 EV(억)"] * acq_ratio  / 100, 1)
             cash = round(base * cash_ratio / 100 * (1 - discount / 100), 1)
             swap = round(base * stock_ratio / 100, 1)
-            acq_rows.append({
-                "기업명":          r["기업명"],
-                "인수기준금액(억)": base,
-                "현금지급액(억)":   cash,
-                "지분스왑액(억)":   swap,
-            })
+            acq_rows.append({"기업명": r["기업명"], "인수기준금액(억)": base,
+                              "현금지급액(억)": cash, "지분스왑액(억)": swap})
 
-        df_acq  = pd.DataFrame(acq_rows)
+        df_acq = pd.DataFrame(acq_rows)
         st.table(df_acq)
-
         s_cash = df_acq["현금지급액(억)"].sum()
         s_swap = df_acq["지분스왑액(억)"].sum()
         f1, f2, f3 = st.columns(3)

@@ -114,75 +114,62 @@ def fetch_corp_codes(key: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fetch_recent_filer_codes(key: str, debug_container=None) -> set:
+def fetch_recent_filer_codes(key: str, years: int = 3,
+                              debug_container=None) -> set:
     """
-    최근 2년 사업보고서 제출 기업 corp_code 집합.
-    pblntf_detail_ty 없이 pblntf_ty=A(정기공시)로 조회해서 더 넓게 잡음.
-    최대 20페이지(2,000개) 수집.
+    DART 제한(corp_code 없이 조회 시 3개월 이내)을 우회하기 위해
+    3개월 단위로 쪼개서 여러 번 호출 후 합산.
+    years=3 이면 12분기 × 최대 50페이지 = 최대 60,000개 수집.
     """
-    end_date   = datetime.today().strftime("%Y%m%d")
-    start_date = (datetime.today() - timedelta(days=730)).strftime("%Y%m%d")
+    from dateutil.relativedelta import relativedelta
+
     codes = set()
     debug_lines = []
+    today = datetime.today()
 
-    # 시도 1: pblntf_detail_ty=A001 (사업보고서)
-    for page in range(1, 21):
-        try:
-            r = requests.get(
-                "https://opendart.fss.or.kr/api/list.json",
-                params={"crtfc_key": key,
-                        "bgn_de": start_date, "end_de": end_date,
-                        "pblntf_detail_ty": "A001",
-                        "page_no": str(page), "page_count": "100"},
-                timeout=12,
-            )
-            d = r.json()
-            status = d.get("status")
-            msg    = d.get("message","")
-            cnt    = len(d.get("list",[]))
-            total_p= d.get("total_page", 1)
-            debug_lines.append(f"[A001 p{page}] status={status} msg={msg} list={cnt}건 total_page={total_p}")
-            if status != "000": break
-            for item in d.get("list", []):
-                cc = item.get("corp_code","")
-                if cc: codes.add(cc)
-            if page >= int(total_p): break
-        except Exception as e:
-            debug_lines.append(f"[A001 p{page}] 예외: {e}")
-            break
+    # 3개월 구간 생성: 최신 → 과거
+    periods = []
+    cursor = today
+    for _ in range(years * 4):          # years년 × 4분기
+        end   = cursor
+        start = cursor - relativedelta(months=3) + timedelta(days=1)
+        periods.append((start.strftime("%Y%m%d"), end.strftime("%Y%m%d")))
+        cursor = cursor - relativedelta(months=3)
 
-    debug_lines.append(f"→ A001 수집 합계: {len(codes)}개")
+    debug_lines.append(f"조회 구간: {len(periods)}개 ({periods[-1][0]} ~ {periods[0][1]})")
 
-    # 시도 2: 코드가 없으면 pblntf_ty=A (정기공시 전체)로 재시도
-    if len(codes) == 0:
-        for page in range(1, 11):
+    for bgn, end in periods:
+        period_codes = set()
+        for page in range(1, 51):       # 구간당 최대 5,000개
             try:
                 r = requests.get(
                     "https://opendart.fss.or.kr/api/list.json",
                     params={"crtfc_key": key,
-                            "bgn_de": start_date, "end_de": end_date,
-                            "pblntf_ty": "A",
+                            "bgn_de": bgn, "end_de": end,
+                            "pblntf_detail_ty": "A001",   # 사업보고서
                             "page_no": str(page), "page_count": "100"},
                     timeout=12,
                 )
                 d = r.json()
-                status = d.get("status")
-                cnt    = len(d.get("list",[]))
-                total_p= d.get("total_page", 1)
-                debug_lines.append(f"[pblntf_ty=A p{page}] status={status} list={cnt}건 total_page={total_p}")
-                if status != "000": break
+                status  = d.get("status")
+                cnt     = len(d.get("list", []))
+                total_p = int(d.get("total_page", 1))
+                if status != "000":
+                    debug_lines.append(f"  [{bgn}~{end} p{page}] status={status} {d.get('message','')}")
+                    break
                 for item in d.get("list", []):
-                    cc = item.get("corp_code","")
-                    if cc: codes.add(cc)
-                if page >= int(total_p): break
+                    cc = item.get("corp_code", "")
+                    if cc: period_codes.add(cc)
+                if page >= total_p: break
             except Exception as e:
-                debug_lines.append(f"[pblntf_ty=A p{page}] 예외: {e}")
+                debug_lines.append(f"  [{bgn}~{end} p{page}] 예외: {e}")
                 break
-        debug_lines.append(f"→ pblntf_ty=A 수집 합계: {len(codes)}개")
+        codes |= period_codes
+        debug_lines.append(f"  [{bgn}~{end}] {len(period_codes)}개 수집 → 누적 {len(codes)}개")
 
+    debug_lines.append(f"\n최종 합계: {len(codes):,}개")
     if debug_container:
         debug_container.code("\n".join(debug_lines))
-
     return codes
 
 

@@ -127,43 +127,44 @@ def fetch_recent_filer_codes(key: str, years: int = 3,
     debug_lines = []
     today = datetime.today()
 
-    # 3개월 구간 생성: 최신 → 과거
+    # 1개월 구간 생성: 최신 → 과거 (3개월 제한이므로 1개월씩 쪼개 촘촘하게)
     periods = []
     cursor = today
-    for _ in range(years * 4):          # years년 × 4분기
+    for _ in range(years * 12):         # years년 × 12개월
         end   = cursor
-        start = cursor - relativedelta(months=3) + timedelta(days=1)
+        start = cursor - relativedelta(months=1) + timedelta(days=1)
         periods.append((start.strftime("%Y%m%d"), end.strftime("%Y%m%d")))
-        cursor = cursor - relativedelta(months=3)
+        cursor = cursor - relativedelta(months=1)
 
     debug_lines.append(f"조회 구간: {len(periods)}개 ({periods[-1][0]} ~ {periods[0][1]})")
 
+    # 사업보고서(A001) + 감사보고서 포함 정기공시(pblntf_ty=A) 두 종류로 조회
+    query_types = [
+        {"pblntf_detail_ty": "A001"},   # 사업보고서
+        {"pblntf_ty": "A"},             # 정기공시 전체 (반기·분기 포함, 더 많은 기업 커버)
+    ]
+
     for bgn, end in periods:
         period_codes = set()
-        for page in range(1, 51):       # 구간당 최대 5,000개
-            try:
-                r = requests.get(
-                    "https://opendart.fss.or.kr/api/list.json",
-                    params={"crtfc_key": key,
-                            "bgn_de": bgn, "end_de": end,
-                            "pblntf_detail_ty": "A001",   # 사업보고서
-                            "page_no": str(page), "page_count": "100"},
-                    timeout=12,
-                )
-                d = r.json()
-                status  = d.get("status")
-                cnt     = len(d.get("list", []))
-                total_p = int(d.get("total_page", 1))
-                if status != "000":
-                    debug_lines.append(f"  [{bgn}~{end} p{page}] status={status} {d.get('message','')}")
+        for qtype in query_types:
+            for page in range(1, 51):
+                try:
+                    params = {"crtfc_key": key, "bgn_de": bgn, "end_de": end,
+                              "page_no": str(page), "page_count": "100"}
+                    params.update(qtype)
+                    r = requests.get("https://opendart.fss.or.kr/api/list.json",
+                                     params=params, timeout=12)
+                    d = r.json()
+                    status  = d.get("status")
+                    total_p = int(d.get("total_page", 1))
+                    if status != "000": break
+                    for item in d.get("list", []):
+                        cc = item.get("corp_code", "")
+                        if cc: period_codes.add(cc)
+                    if page >= total_p: break
+                except Exception as e:
+                    debug_lines.append(f"  [{bgn}~{end}] 예외: {e}")
                     break
-                for item in d.get("list", []):
-                    cc = item.get("corp_code", "")
-                    if cc: period_codes.add(cc)
-                if page >= total_p: break
-            except Exception as e:
-                debug_lines.append(f"  [{bgn}~{end} p{page}] 예외: {e}")
-                break
         codes |= period_codes
         debug_lines.append(f"  [{bgn}~{end}] {len(period_codes)}개 수집 → 누적 {len(codes)}개")
 
@@ -187,7 +188,7 @@ def fetch_company_info_single(key: str, corp_code: str) -> dict:
 def fetch_fin_single(key: str, corp_code: str) -> dict:
     """최신 연도(2024→2023→2022) 재무. 성공하면 figures + 연도 반환."""
     base = {"crtfc_key": key, "corp_code": corp_code, "reprt_code": "11011"}
-    for yr in ["2024", "2023", "2022"]:
+    for yr in ["2025", "2024", "2023", "2022"]:
         for endpoint, fs_div in [("fnlttSinglAcnt", None),
                                   ("fnlttSinglAcntAll", "OFS"),
                                   ("fnlttSinglAcntAll", "CFS")]:
@@ -404,7 +405,7 @@ if menu_tab == "1. 타깃 스크리닝 & 정밀분석":
 
         # 3개년 재무
         st.subheader(f"📈 {selected_name} — 3개년 재무 추이")
-        years    = ["2024", "2023", "2022"]
+        years    = ["2025", "2024", "2023", "2022"]
         fin_rows = []
         all_logs = []
         fs_div_used = None
